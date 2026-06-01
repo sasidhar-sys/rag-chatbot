@@ -135,18 +135,34 @@ def chat():
         conversation.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
     conversation.append(types.Content(role="user", parts=[types.Part(text=f"{system}\n\nQuestion: {query}")]))
 
-    try:
-        response = client.models.generate_content(
-            model=MODEL_ID,
-            contents=conversation,
-        )
-        return jsonify({
-            "answer": response.text,
-            "sources": list({c["source"] for c in chunks}),
-            "chunks_used": len(chunks)
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    import time
+    from google.genai.errors import APIError
+
+    models_to_try = [MODEL_ID, 'gemini-1.5-flash', 'gemini-2.0-flash']
+    max_retries = 3
+
+    for model in models_to_try:
+        for attempt in range(max_retries):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=conversation,
+                )
+                return jsonify({
+                    "answer": response.text,
+                    "sources": list({c["source"] for c in chunks}),
+                    "chunks_used": len(chunks)
+                })
+            except APIError as e:
+                if "503" in str(e) or "UNAVAILABLE" in str(e):
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    return jsonify({"error": str(e)}), 500
+            except Exception as e:
+                return jsonify({"error": str(e)}), 500
+
+    return jsonify({"error": "All models are currently experiencing high demand. Please try again in a few minutes."}), 503
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
