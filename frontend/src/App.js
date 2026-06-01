@@ -62,8 +62,30 @@ function DocCard({ doc, onRemove }) {
   );
 }
 
-function Message({ msg }) {
+function Message({ msg, onSend }) {
   const isUser = msg.role === "user";
+  
+  let content = msg.content;
+  let followUps = [];
+
+  if (!isUser && content) {
+    const marker1 = "**Follow-up questions:**";
+    const marker2 = "Follow-up questions:";
+    
+    let parts = [];
+    if (content.includes(marker1)) parts = content.split(marker1);
+    else if (content.includes(marker2)) parts = content.split(marker2);
+    
+    if (parts.length > 1) {
+      content = parts[0].trim();
+      const rawFollowUps = parts[1].trim();
+      followUps = rawFollowUps.split('\n')
+        .map(line => line.trim())
+        .filter(line => line.startsWith('-') || line.startsWith('*'))
+        .map(line => line.replace(/^[-*]\s*/, '').trim());
+    }
+  }
+
   return (
     <div className={`msg-row ${isUser ? "user" : "bot"}`}>
       <div className={`avatar ${isUser ? "av-user" : "av-bot"}`}>
@@ -74,9 +96,18 @@ function Message({ msg }) {
           {isUser ? (
             <p>{msg.content}</p>
           ) : (
-            <ReactMarkdown>{msg.content}</ReactMarkdown>
+            <ReactMarkdown>{content}</ReactMarkdown>
           )}
         </div>
+        
+        {followUps.length > 0 && (
+          <div className="starters" style={{ marginTop: '8px', justifyContent: 'flex-start' }}>
+            {followUps.map((q, idx) => (
+              <button key={idx} className="starter" onClick={() => onSend(q)}>{q}</button>
+            ))}
+          </div>
+        )}
+
         <div className="msg-footer">
           <span className="msg-time">{msg.time}</span>
           {msg.sources?.length > 0 && (
@@ -324,7 +355,7 @@ export default function App() {
               </div>
             ) : (
               <div className="messages">
-                {messages.map((msg, i) => <Message key={i} msg={msg} />)}
+                {messages.map((msg, i) => <Message key={i} msg={msg} onSend={send} />)}
                 {loading && (
                   <div className="msg-row bot">
                     <div className="avatar av-bot">G</div>
