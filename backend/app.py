@@ -23,7 +23,18 @@ CORS(app)
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY", ""))
+client = None
+
+def get_client():
+    global client
+    if client is None:
+        # Use key from environment
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY environment variable is not set!")
+        client = genai.Client(api_key=api_key)
+    return client
+
 MODEL_ID = "gemini-2.5-flash"
 EMBED_MODEL = "models/text-embedding-004"
 
@@ -51,20 +62,20 @@ def chunk_text(text):
 
 def get_embedding(text):
     """Get embedding from Gemini API (runs on Google's cloud, no local RAM needed)."""
-    result = client.models.embed_content(
+    result = get_client().models.embed_content(
         model=EMBED_MODEL,
         contents=text,
-        config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT")
+        config=types.EmbedContentConfig(task_type="retrieval_document")
     )
     return np.array(result.embeddings[0].values, dtype="float32")
 
 
 def get_query_embedding(text):
     """Get query embedding from Gemini API."""
-    result = client.models.embed_content(
+    result = get_client().models.embed_content(
         model=EMBED_MODEL,
         contents=text,
-        config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY")
+        config=types.EmbedContentConfig(task_type="retrieval_query")
     )
     return np.array(result.embeddings[0].values, dtype="float32")
 
@@ -176,7 +187,7 @@ def chat():
     for model in models_to_try:
         for attempt in range(3):
             try:
-                response = client.models.generate_content(model=model, contents=conversation)
+                response = get_client().models.generate_content(model=model, contents=conversation)
                 return jsonify({
                     "answer": response.text,
                     "sources": list({c["source"] for c in chunks}),
