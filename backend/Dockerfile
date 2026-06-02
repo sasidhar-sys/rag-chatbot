@@ -1,28 +1,29 @@
-# Use an official Python runtime as a parent image
 FROM python:3.11-slim
 
-# Set the working directory
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
-# Install system dependencies (required for some Python packages like faiss)
-RUN apt-get update && apt-get install -y \
+# Install system build tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements file
+# Step 1: Install CPU-only PyTorch FIRST (avoids pip downloading 2GB CUDA torch)
+RUN pip install --no-cache-dir \
+    torch==2.2.0+cpu \
+    --index-url https://download.pytorch.org/whl/cpu
+
+# Step 2: Install all other dependencies
 COPY requirements.txt .
-
-# Install CPU-only PyTorch first to prevent downloading massive CUDA binaries (saves 2GB+ space/RAM)
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-
-# Install other dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application code
+# Step 3: Copy application code
 COPY . .
 
-# Expose port 5000
+# Render assigns a dynamic PORT env var
 EXPOSE 5000
 
-# Start the application using python
-CMD ["python", "app.py"]
+# Use gunicorn for production (more stable than Flask dev server)
+CMD gunicorn --bind 0.0.0.0:${PORT:-5000} --timeout 120 --workers 1 app:app
