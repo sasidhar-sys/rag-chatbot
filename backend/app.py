@@ -1,20 +1,21 @@
 import os
+import time
+import uuid
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-import uuid
 import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError
 from pypdf import PdfReader
-import faiss
-from sentence_transformers import SentenceTransformer
 
 app = Flask(__name__)
 CORS(app)
@@ -24,12 +25,13 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY", ""))
 MODEL_ID = "gemini-2.5-flash"
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+EMBED_MODEL = "models/text-embedding-004"
 
 sessions = {}
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 80
 TOP_K = 5
+
 
 def extract_text(filepath):
     if filepath.endswith(".pdf"):
@@ -38,6 +40,7 @@ def extract_text(filepath):
     with open(filepath, "r", errors="ignore") as f:
         return f.read()
 
+
 def chunk_text(text):
     chunks, i = [], 0
     while i < len(text):
@@ -45,36 +48,42 @@ def chunk_text(text):
         i += CHUNK_SIZE - CHUNK_OVERLAP
     return [c for c in chunks if len(c) > 40]
 
-def build_index(chunks):
-    embs = embedder.encode(chunks, show_progress_bar=False)
-    embs = np.array(embs, dtype="float32")
-    faiss.normalize_L2(embs)
-    index = faiss.IndexFlatIP(embs.shape[1])
-    index.add(embs)
-    return index
 
-def retrieve(query, session_id):
-    store = sessions.get(session_id)
-    if not store or not store["index"]:
-        return []
-    q = np.array(embedder.encode([query]), dtype="float32")
-    faiss.normalize_L2(q)
-    scores, indices = store["index"].search(q, min(TOP_K, len(store["chunks"])))
-    return [
-        {"text": store["chunks"][i], "source": store["meta"][i]["source"], "score": float(s)}
-        for s, i in zip(scores[0], indices[0])
-        if i >= 0 and s > 0.1
-    ]
+def get_embedding(text):
+    """Get embedding from Gemini API (runs on Google's cloud, no local RAM needed)."""
+    result = client.models.embed_content(
+        model=EMBED_MODEL,
+        contents=text,
+        config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT")
+    )
+    return np.array(result.embeddings[0].values, dtype="float32")
+
+
+def get_query_embedding(text):
+    """Get query embedding from Gemini API."""
+    result = client.models.embed_content(
+        model=EMBED_MODEL,
+        contents=text,
+        config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY")
+    )
+    return np.array(result.embeddings[0].values, dtype="float32")
+
+
+def cosine_similarity(a, b):
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
+
 
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "model": MODEL_ID})
 
+
 @app.route("/session", methods=["POST"])
 def create_session():
     sid = str(uuid.uuid4())
-    sessions[sid] = {"chunks": [], "index": None, "meta": [], "docs": []}
+    sessions[sid] = {"chunks": [], "embeddings": [], "meta": [], "docs": []}
     return jsonify({"session_id": sid})
+
 
 @app.route("/ingest", methods=["POST"])
 def ingest():
@@ -95,18 +104,40 @@ def ingest():
         if not text.strip():
             return jsonify({"error": "No text extracted"}), 400
         chunks = chunk_text(text)
-        meta = [{"source": filename} for _ in chunks]
         store = sessions[sid]
+        new_embeddings = []
+        for chunk in chunks:
+            emb = get_embedding(chunk)
+            new_embeddings.append(emb)
         store["chunks"].extend(chunks)
-        store["meta"].extend(meta)
+        store["embeddings"].extend(new_embeddings)
+        store["meta"].extend([{"source": filename} for _ in chunks])
         store["docs"].append({"name": filename, "chunks": len(chunks)})
-        store["index"] = build_index(store["chunks"])
         return jsonify({"success": True, "filename": filename, "chunks": len(chunks)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
         if os.path.exists(filepath):
             os.remove(filepath)
+
+
+def retrieve(query, session_id):
+    store = sessions.get(session_id)
+    if not store or not store["embeddings"]:
+        return []
+    q_emb = get_query_embedding(query)
+    scored = []
+    for i, emb in enumerate(store["embeddings"]):
+        score = cosine_similarity(q_emb, emb)
+        scored.append((score, i))
+    scored.sort(reverse=True)
+    top = scored[:TOP_K]
+    return [
+        {"text": store["chunks"][i], "source": store["meta"][i]["source"], "score": s}
+        for s, i in top
+        if s > 0.1
+    ]
+
 
 @app.route("/chat", methods=["POST"])
 def chat():
@@ -118,36 +149,34 @@ def chat():
         return jsonify({"error": "Invalid session"}), 400
     if not query:
         return jsonify({"error": "Empty query"}), 400
+
     chunks = retrieve(query, sid)
     if chunks:
         context = "\n\n".join(
             f"[{i+1}] (from {c['source']})\n{c['text']}"
             for i, c in enumerate(chunks)
         )
-        system = f"You are a document analyst. Answer ONLY from this context. Cite sources. At the end of your response, always suggest 2-3 relevant follow-up questions the user could ask next to explore the document further, formatted as a bulleted list under the heading '**Follow-up questions:**'.\n\nCONTEXT:\n{context}"
+        system = (
+            f"You are a document analyst. Answer ONLY from this context. Cite sources. "
+            f"At the end of your response, always suggest 2-3 relevant follow-up questions the user "
+            f"could ask next to explore the document further, formatted as a bulleted list under the heading "
+            f"'**Follow-up questions:**'.\n\nCONTEXT:\n{context}"
+        )
     else:
         system = "You are a helpful assistant. No documents uploaded yet. Ask user to upload one."
 
-    # Build conversation for new SDK
     conversation = []
     for msg in history[-6:]:
         role = "user" if msg["role"] == "user" else "model"
         conversation.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
     conversation.append(types.Content(role="user", parts=[types.Part(text=f"{system}\n\nQuestion: {query}")]))
 
-    import time
-    from google.genai.errors import APIError
-
-    models_to_try = [MODEL_ID, 'gemini-1.5-flash', 'gemini-2.0-flash']
-    max_retries = 3
+    models_to_try = [MODEL_ID, "gemini-1.5-flash", "gemini-2.0-flash"]
 
     for model in models_to_try:
-        for attempt in range(max_retries):
+        for attempt in range(3):
             try:
-                response = client.models.generate_content(
-                    model=model,
-                    contents=conversation,
-                )
+                response = client.models.generate_content(model=model, contents=conversation)
                 return jsonify({
                     "answer": response.text,
                     "sources": list({c["source"] for c in chunks}),
@@ -157,14 +186,13 @@ def chat():
                 if "503" in str(e) or "UNAVAILABLE" in str(e):
                     time.sleep(2 ** attempt)
                     continue
-                else:
-                    return jsonify({"error": str(e)}), 500
+                return jsonify({"error": str(e)}), 500
             except Exception as e:
                 return jsonify({"error": str(e)}), 500
 
     return jsonify({"error": "All models are currently experiencing high demand. Please try again in a few minutes."}), 503
 
+
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
