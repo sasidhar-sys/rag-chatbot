@@ -36,7 +36,7 @@ def get_client():
     return client
 
 MODEL_ID = "gemini-2.5-flash"
-EMBED_MODEL = "models/text-embedding-004"
+EMBED_MODEL = "gemini-embedding-2"
 
 sessions = {}
 CHUNK_SIZE = 500
